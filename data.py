@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
-from data.multiscenes_dataset import MultiscenesDataset, collate_fn
+from dataset.multiscenes_dataset import MultiscenesDataset, collate_fn
 
 
 class MultiscenesDataModule(pl.LightningDataModule):

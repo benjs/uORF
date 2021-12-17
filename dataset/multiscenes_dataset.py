@@ -2,7 +2,7 @@ import os
 
 import torchvision.transforms.functional as TF
 
-from data.base_dataset import BaseDataset
+from dataset.base_dataset import BaseDataset
 from PIL import Image
 import torch
 import glob
