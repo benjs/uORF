@@ -9,8 +9,8 @@
 #SBATCH --partition=gpu_8
 
 # Output files
-#SBATCH --output=../out/R-%x.%j.out
-#SBATCH --error=../out/R-%x.%j.err
+#SBATCH --output=../out/T-%x.%j.out
+#SBATCH --error=../out/T-%x.%j.err
 
 # 216:00:00
 # 48:00:00
@@ -21,4 +21,4 @@ source ~/.bashrc
 conda activate uorf-3090
 
 echo 'Start training'
-exec custom/train.sh
+exec scripts/train.sh

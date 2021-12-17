@@ -9,12 +9,12 @@
 #SBATCH --partition=gpu_4
 
 # Output files
-#SBATCH --output=../out/R-%x.%j.out
-#SBATCH --error=../out/R-%x.%j.err
+#SBATCH --output=../out/E-%x.%j.out
+#SBATCH --error=../out/E-%x.%j.err
 
 echo 'Activate conda environment'
 source ~/.bashrc
 conda activate uorf-3090
 
 echo 'Start evaluation'
-exec custom/eval.sh
+exec scripts/eval.sh
