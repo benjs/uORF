@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch import nn, optim
 from torchvision.transforms.transforms import Normalize
-from custom.visualization import make_average_gradient_plot
+from util.visualization import make_average_gradient_plot
 
 from models.model import Decoder, Discriminator, Encoder, SlotAttention, d_logistic_loss, d_r1_loss, g_nonsaturating_loss, get_perceptual_net, raw2outputs, toggle_grad
 from models.networks import get_scheduler, init_weights

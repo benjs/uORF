@@ -3,7 +3,7 @@ from piq import psnr, ssim
 import torch
 import torch.nn.functional as F
 
-from custom.model import uorfGanModel
+from models.train_model import uorfGanModel
 from models.model import raw2outputs
 from util.util import AverageMeter
 
