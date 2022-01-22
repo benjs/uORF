@@ -3,3 +3,4 @@ lightning_logs
 checkpoints
 slurm-*
 __pycache__
+venv/
