@@ -14,9 +14,10 @@ class MultiscenesDataModule(pl.LightningDataModule):
             print('Fetching train dataset ...')
             self.train_dataset = MultiscenesDataset(self.opt, is_train=True)
 
-        if stage in (None, 'test'):
+        if stage in (None, 'test', 'predict'):
             print('Fetching test dataset...')
             self.test_dataset = MultiscenesDataset(self.opt, is_train=False)
+
     
     @staticmethod
     def collate_fn_batches(data):
@@ -93,3 +94,6 @@ class MultiscenesDataModule(pl.LightningDataModule):
             collate_fn = collate_fn,
             persistent_workers=False
         )
+
+    def predict_dataloader(self):
+        return self.test_dataloader()
