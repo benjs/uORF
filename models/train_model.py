@@ -178,7 +178,7 @@ class uorfGanModel(pl.LightningModule):
 
 
     def on_epoch_end(self) -> None:
-        if self.opt.custom_lr:
+        if self.opt.custom_lr and self.lr_schedulers() is not None:
             uorf_scheduler, _ = self.lr_schedulers()
             uorf_scheduler.step()
 

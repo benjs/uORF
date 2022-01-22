@@ -81,11 +81,11 @@ class uorfTestGanModel(uorfGanModel):
             x_recon[..., h::scale, w::scale] = x_recon_
 
         # x_recon_novel, x_novel = x_recon[1:], imgs[1:]
-        return x_recon, imgs, (masked_raws.detach(), unmasked_raws.detach())
+        return x_recon, imgs, (masked_raws.detach(), unmasked_raws.detach(), attn.detach(), cam2world)
 
 
     def test_step(self, batch, batch_idx):
-        x_recon, imgs, (masked_raws, unmasked_raws) = self(batch)  # B×S×C×H×W
+        x_recon, imgs, (masked_raws, unmasked_raws, attn, cam2world) = self(batch)  # B×S×C×H×W
 
         x_recon_novel, x_novel = x_recon[1:], imgs[1:]
         loss_recon = self.L2_loss(x_recon_novel, x_novel)
@@ -100,15 +100,14 @@ class uorfTestGanModel(uorfGanModel):
             'loss_ssim': loss_ssim.cpu().item(),
             }, prog_bar=True)
 
-        print('loss_lpips', loss_lpips.cpu().item())
-        print('loss_psnr', loss_psnr.cpu().item())
-        print('loss_ssim', loss_ssim.cpu().item())
-
         self.loss_recon_avg.update(loss_recon)
         self.loss_lpips_avg.update(loss_lpips)
         self.loss_psnr_avg.update(loss_psnr)
         self.loss_ssim_avg.update(loss_ssim)
 
+        print('loss_lpips', loss_lpips.cpu().item(), "-", self.loss_lpips_avg.avg.cpu().item())
+        print('loss_psnr', loss_psnr.cpu().item(), "-", self.loss_psnr_avg.avg.cpu().item())
+        print('loss_ssim', loss_ssim.cpu().item(), "-", self.loss_ssim_avg.avg.cpu().item())
 
     def on_test_end(self) -> None:
         print("--- Results ---")
@@ -116,3 +115,6 @@ class uorfTestGanModel(uorfGanModel):
         print("LPIPS", self.loss_lpips_avg.avg)
         print("PSNR", self.loss_psnr_avg.avg)
         print("SSIM", self.loss_ssim_avg.avg)
+
+    def on_epoch_end(self):
+        pass
