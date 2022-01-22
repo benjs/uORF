@@ -6,8 +6,9 @@ from torch import nn, optim
 from torchvision.transforms.transforms import Normalize
 from util.visualization import make_average_gradient_plot
 
-from models.model import Decoder, Discriminator, Encoder, SlotAttention, d_logistic_loss, d_r1_loss, g_nonsaturating_loss, get_perceptual_net, raw2outputs, toggle_grad
-from models.networks import get_scheduler, init_weights
+from models.model import Decoder, Discriminator, Encoder, SlotAttention, d_logistic_loss, \
+    d_r1_loss, g_nonsaturating_loss, get_perceptual_net, raw2outputs, toggle_grad
+from models.helper import get_scheduler, init_weights
 from models.projection import Projection
 
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -87,7 +88,7 @@ class uorfGanModel(pl.LightningModule):
             first_imgs, size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxFxC
 
-        z_slots, attn = self.netSlotAttention(feat)  # B×K×C, B×K×F
+        z_slots, attn = self.netSlotAttention(feat)  # B×K×C, B×K×F # what is C?
         K = z_slots.shape[1]
 
         # combine batches and number of imgs per scene
@@ -137,7 +138,7 @@ class uorfGanModel(pl.LightningModule):
         sampling_coor_bg = frus_nss_coor  # B×Px3
 
         # Run decoder
-        raws, masked_raws, unmasked_raws, maks = self.netDecoder(
+        raws, masked_raws, unmasked_raws, masks = self.netDecoder(
             sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  
         # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4,  (Kx(NxDxHxW)x1 <- masks, not needed)
 
