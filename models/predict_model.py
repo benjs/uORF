@@ -1,9 +1,10 @@
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
+from torch import torch_version
 from models.model import raw2outputs
 from models.test_model import uorfTestGanModel
-from torchvision.utils import save_image
+from torchvision.utils import make_grid
 
 from util.util import tensor2im
 
@@ -24,4 +25,9 @@ class uorfPredictGanModel(uorfTestGanModel):
             img = Image.fromarray(tensor2im(x_recon[i]))
             img.save(self.output_dir / f"{batch_idx*N+i:05d}_sc{batch_idx:04d}_az{i:02d}_x_rec.png")
 
-        
+        grid_img = make_grid(
+            [img for img in imgs] + [rec for rec in x_recon],
+            nrow=4
+        )
+        Image.fromarray(tensor2im(grid_img)).save(self.output_dir / f"{batch_idx*N:05d}_sc{batch_idx:04d}_all.png")
+    
