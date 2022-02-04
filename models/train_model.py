@@ -4,10 +4,11 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch import nn, optim
 from torchvision.transforms.transforms import Normalize
+from zmq import device
 from util.visualization import make_average_gradient_plot
 
 from models.model import Decoder, Discriminator, Encoder, SlotAttention, d_logistic_loss, \
-    d_r1_loss, g_nonsaturating_loss, get_perceptual_net, raw2outputs, toggle_grad
+    d_r1_loss, g_nonsaturating_loss, get_perceptual_net, raw2outputs, render_image, render_mask, toggle_grad
 from models.helper import get_scheduler, init_weights
 from models.projection import Projection
 
@@ -44,6 +45,20 @@ class uorfGanModel(pl.LightningModule):
             device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size_fine, 
             near=opt.near_plane, far=opt.far_plane, render_size=render_size)
         
+        frustum_size_mask_computation = [32, 32, opt.n_samp ]
+        self.projection_mask_comp = Projection(
+            device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size_mask_computation, 
+            near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+
+        mask_idx = torch.arange(opt.frustum_size_fine**2, requires_grad=False, dtype=int)
+        mask_idx_img = mask_idx.reshape((opt.frustum_size_fine, opt.frustum_size_fine))
+        self.register_buffer('mask_idx', mask_idx, persistent=False)
+        self.register_buffer('mask_idx_img', mask_idx_img, persistent=False)
+
+        x_idx, y_idx = torch.meshgrid(torch.arange(32), torch.arange(32))
+        self.register_buffer('x_idx', x_idx, persistent=False)
+        self.register_buffer('y_idx', y_idx, persistent=False)
+
         # Slot attention noise dim and number of slots
         z_dim = opt.z_dim
         self.num_slots = opt.num_slots
@@ -70,7 +85,6 @@ class uorfGanModel(pl.LightningModule):
         # Loss module for reconstruction and perceptual loss
         self.L2_loss = nn.MSELoss()
 
-
     def forward(self, input):
         imgs, cam2world, cam2world_azi = input  # B×S×C×H×W, B×S×4×4, B×S×3×3
         
@@ -94,15 +108,20 @@ class uorfGanModel(pl.LightningModule):
         # combine batches and number of imgs per scene
         N = B*S
         cam2world = cam2world.view(N, 4, 4)  # N×4×4
-        imgs = imgs.view(N, C, H, W)
+        
+        # Output indices for visualization
+        ray_indices_all = None
+        imgs_percept = None
 
         # Use full image for training, resize to supervision size
         if self.opt.stage == 'coarse':
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
 
+            imgs = imgs.view(N, C, H, W)
             imgs = F.interpolate(
                 imgs, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
+            imgs_percept = imgs
 
             # Bring back batch dimension
             W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
@@ -111,29 +130,121 @@ class uorfGanModel(pl.LightningModule):
 
         # Use part of image for finer training
         else:
-            W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp  
-            frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
-            # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            """
+            Evaluate the NeRF on a low resolution and compute masks for each object
+            in each view. Then compute the mask's center of mass, which is the center
+            of the region to cut out that object.
+            Then, for each image, combine all cut-out regions.
+            """
+            out_size = self.opt.supervision_size  # 80
+            imgs = imgs.view(B, S, C, H*W)  # this shape is needed for sampling later
+            new_imgs = torch.empty(B, S, C, out_size**2, device=cam2world.device)
+            ray_indices_all = torch.empty(B, S, out_size**2, device=cam2world.device, dtype=torch.long)
 
-            # Bring back batch dimension
-            frus_nss_coor = frus_nss_coor.view([B, S, D, H, W, 3])
-            z_vals, ray_dir = z_vals.view([B, S, H, W, D]), ray_dir.view([B, S, H, W, 3])
+            # Compute fine (128**2) sampling grid, from which in turn rays are sampled
+            # according to the masks
+            W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
+            frus_nss_coor_fine, z_vals_fine, ray_dir_fine = self.projection_fine.construct_sampling_coor(cam2world)
+            frus_nss_coor_fine = frus_nss_coor_fine.view([B, S, D, H*W, 3])
+            z_vals_fine = z_vals_fine.view([B, S, H*W, D])
+            ray_dir_fine = ray_dir_fine.view([B, S, H*W, 3])
 
-            # Cut out part of image
-            start_range = self.opt.frustum_size_fine - self.opt.render_size
-            H_idx = torch.randint(low=0, high=start_range, size=(1,), device=self.device)
-            W_idx = torch.randint(low=0, high=start_range, size=(1,), device=self.device)
+            # To be filled using the masks:
+            frus_nss_coor = torch.empty(B, S, D, out_size**2, 3, device=cam2world.device)
+            z_vals = torch.empty(B, S, out_size**2, D, device=cam2world.device)
+            ray_dir = torch.empty(B, S, out_size**2, 3, device=cam2world.device)
 
-            rs = self.opt.render_size
-            frus_nss_coor_= frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            z_vals_  = z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            ray_dir_ = ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
+            with torch.no_grad():
+                # --------------------------------------------- #
+                # Compute a mask for each scene, which hints
+                # to where foreground objects are located
+                # --------------------------------------------- #
+                Hm = Wm = 32 # Height and width of mask
+                frus_nss_coor_mask, z_vals_mask, ray_dir_mask = \
+                    self.projection_mask_comp.construct_sampling_coor(cam2world)
+                # (NxDxHmxWm)x3, (NxHmxWm)xD, (NxHmxWm)x3
 
-            frus_nss_coor = frus_nss_coor_.flatten(1, 4)
-            z_vals, ray_dir = z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
+                # Bring back batch dimension
+                frus_nss_coor_mask = frus_nss_coor_mask.view(B, S*D*Hm*Wm, 3)
+                z_vals_mask = z_vals_mask.view(B, S*Hm*Wm, D)
+                ray_dir_mask = ray_dir_mask.view(B, S*Hm*Wm, 3)
 
-        # Repeat sampling coordinates for each object (K-1 objects, one background), P = S*D*H*W
+                sampling_coor_fg_mask = \
+                    frus_nss_coor_mask[:, None, ...].expand(-1, K - 1, -1, -1)  # B×(K-1)xPx3
+                sampling_coor_bg_mask = frus_nss_coor_mask  # B×Px3
+
+                _, masked_raws_mask, _, _ = \
+                    self.netDecoder(sampling_coor_bg_mask, sampling_coor_fg_mask, z_slots, nss2cam0)
+            
+                masked_raws_mask = masked_raws_mask.view([B, K, S, D, Hm, Wm, 4])
+
+                for b in range(B):
+                    # Only render foreground objects
+                    rendered_masks = torch.empty(K - 1, S, Hm, Wm, device=cam2world.device)
+
+                    # Render segmented binary 32x32 mask for each slot
+                    for k in range(1, K):
+                        raws = masked_raws_mask[b, k]  # SxDxHxWx4
+                        raws = raws.permute(0, 2, 3, 1, 4).flatten(0, 2)
+                        rendered_mask = render_mask(raws, z_vals_mask[b], ray_dir_mask[b]).view(S, Hm, Wm)
+                        rendered_masks[k-1] = rendered_mask
+            
+                    # Compute combined mask for each scene,
+                    # which will later be used for ray selection
+                    mask = torch.zeros(S, 128, 128, dtype=torch.bool, device=cam2world.device)
+                    for s in range(S):
+                        box_size = 12
+                        box_size_o=48
+
+                        for k in range(1, K):
+                            # Compute center of mass of k-th object in s-th scence
+                            mask_k_s = rendered_masks[k - 1, s]
+                            mass = torch.sum(mask_k_s)
+
+                            x_com = torch.floor_divide(torch.sum(mask_k_s * self.x_idx), mass)
+                            y_com = torch.floor_divide(torch.sum(mask_k_s * self.y_idx), mass)
+
+                            x_com = torch.clip(x_com - box_size//2, 0, Hm - box_size).int() * 4
+                            y_com = torch.clip(y_com - box_size//2, 0, Wm - box_size).int() * 4
+
+                            mask[s, x_com:x_com+(box_size_o), y_com:y_com+(box_size_o)] = True
+                    
+                        # --------------------------------------------- #
+                        # using the computed masks, we gather the rays
+                        # from the original sized image
+                        # --------------------------------------------- #
+
+                        # Ray indices is a vector with values from 0 to 128**2,
+                        # which express which ray of the 128**2 image should be rendered
+                        ray_indices = self.mask_idx_img.masked_select(mask[s])
+                        outside_indices = self.mask_idx_img.masked_select(mask[s].logical_not())
+
+                        # Always render out_size**2 rays.
+                        num_rays = len(ray_indices)
+                        if num_rays > out_size**2:
+                            selected_idx = torch.randperm(num_rays)[:out_size**2]
+                            ray_indices = ray_indices[selected_idx]
+                        elif num_rays < out_size**2:
+                            num_indices_needed = out_size**2 - num_rays
+                            additional_indices = torch.randperm(len(outside_indices))[:num_indices_needed]
+                            ray_indices = torch.cat((ray_indices, self.mask_idx[additional_indices]))
+                        
+                        assert len(ray_indices) == out_size**2
+                        frus_nss_coor[b, s] = frus_nss_coor_fine[b, s, :, ray_indices, :]
+                        z_vals[b, s] = z_vals_fine[b, s, ray_indices, :]
+                        ray_dir[b, s] = ray_dir_fine[b, s, ray_indices, :]
+                        new_imgs[b, s] = imgs[b, s, :, ray_indices]
+                        imgs[b, s, :, outside_indices] = 0.  # Imgs now only the selected pixels, all others are zero
+                        ray_indices_all[b, s] = ray_indices
+
+            W, H, D = out_size, out_size, self.opt.n_samp
+            frus_nss_coor = frus_nss_coor.view([B, S*D*H*W, 3])
+            z_vals = z_vals.view([B, S*H*W, D])
+            ray_dir = ray_dir.view([B, S*H*W, 3])
+            imgs_percept = imgs  # Imgs percept contain only the selected pixels, all others are zero
+            imgs = new_imgs
+
+        # Repeat sampling coordinates for each object (K-1 objects, one background), P = S*D*80**2
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # B×(K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # B×Px3
 
@@ -143,7 +254,6 @@ class uorfGanModel(pl.LightningModule):
         # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4,  (Kx(NxDxHxW)x1 <- masks, not needed)
 
         # Reshape for further processing
-        W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
         imgs = imgs.view(B, S, C, H, W)
         raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # B×(NxHxW)xDx4
         masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
@@ -151,13 +261,26 @@ class uorfGanModel(pl.LightningModule):
         
         rgb_maps = []
         for i in range(B):
-            rgb_map, _, _ = raw2outputs(raws[i], z_vals[i], ray_dir[i])
+            rgb_map = render_image(raws[i], z_vals[i], ray_dir[i])
             rgb_maps.append(rgb_map)
             # (NxHxW)x3, (NxHxW)
         rgb_map_out = torch.stack(rgb_maps)
 
-        img_rendered = rgb_map_out.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # B×Nx3xHxW
-        return imgs, img_rendered, \
+        imgs_rendered = rgb_map_out.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # B×Nx3xHxW
+
+        if self.opt.stage == 'coarse':
+            imgs_percept = imgs_percept.view(B, S, C, H, W)
+            imgs_percept_rendered = imgs_rendered
+        else:
+            imgs_percept_rendered = torch.zeros(B, N, 3, 128*128, device=imgs_rendered.device)
+            for b in range(B):
+                for s in range(S):
+                    imgs_percept_rendered[b, s, :, ray_indices_all[b, s]] = imgs.view(B, S, C, H*W)[b, s]
+
+            imgs_percept = imgs_percept.view(B, S, C, 128, 128)
+            imgs_percept_rendered = imgs_percept_rendered.view(B, N, 3, 128, 128)
+
+        return imgs, imgs_rendered, imgs_percept, imgs_percept_rendered, \
             (masked_raws.detach(), unmasked_raws.detach(), z_vals, ray_dir, attn.detach())
 
 
@@ -213,7 +336,7 @@ class uorfGanModel(pl.LightningModule):
 
     def optimize_uorf(self, batch):
         # Forward batch
-        imgs, imgs_rendered, raw_data = self(batch)
+        imgs, imgs_rendered, imgs_percept, imgs_percept_rendered, raw_data = self(batch)
         imgs_reconstructed = imgs_rendered * 2 - 1
 
         # Combine batches and number of imgs in scene
@@ -221,6 +344,10 @@ class uorfGanModel(pl.LightningModule):
         imgs = imgs.view(B*S, C, H, W)
         imgs_rendered = imgs_rendered.view(B*S, C, H, W)
         imgs_reconstructed = imgs_reconstructed.view(B*S, C, H, W)
+
+        _, _, _, HP, WP = imgs_percept.shape
+        imgs_percept = imgs_percept.view(B*S, C, HP, WP)
+        imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, HP, WP)
 
         # Adverserial loss
         d_fake = self.netDisc(imgs_reconstructed)
@@ -230,7 +357,7 @@ class uorfGanModel(pl.LightningModule):
         loss_recon = self.L2_loss(imgs_reconstructed, imgs)
 
         # Perceptual loss
-        x_norm, rendered_norm = self.vgg_norm((imgs + 1) / 2), self.vgg_norm(imgs_rendered)
+        x_norm, rendered_norm = self.vgg_norm((imgs_percept + 1) / 2), self.vgg_norm(imgs_percept_rendered)
         rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
         loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
@@ -250,12 +377,12 @@ class uorfGanModel(pl.LightningModule):
                 }, prog_bar=True, rank_zero_only=True)
 
             if (self.global_step) % self.opt.display_freq == 0:
-                self.log_visualizations(imgs, imgs_reconstructed, raw_data=raw_data)
+                self.log_visualizations(imgs, imgs_reconstructed, imgs_percept, imgs_percept_rendered, raw_data=raw_data)
 
 
     def optimize_discriminator(self, batch, batch_idx):
         # Forward batch
-        imgs, imgs_rendered, raw_data = self(batch)
+        imgs, imgs_rendered, imgs_percept, imgs_percept_rendered, raw_data = self(batch)
         imgs_reconstructed = imgs_rendered * 2 - 1
 
         # Combine batches and number of imgs in scene 
@@ -263,6 +390,8 @@ class uorfGanModel(pl.LightningModule):
         imgs = imgs.view(B*S, C, H, W)
         imgs_rendered = imgs_rendered.view(B*S, C, H, W)
         imgs_reconstructed = imgs_reconstructed.view(B*S, C, H, W)
+        imgs_percept = imgs_percept.view(B*S, C, 128, 128)
+        imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, 128, 128)
 
         toggle_grad(self.netDisc, True)
         fake_pred = self.netDisc(imgs_reconstructed)
@@ -294,14 +423,14 @@ class uorfGanModel(pl.LightningModule):
                 }, prog_bar=False, rank_zero_only=True)
 
             if (self.global_step) % self.opt.display_freq == 0:
-                self.log_visualizations(imgs, imgs_reconstructed, raw_data=raw_data)
+                self.log_visualizations(imgs, imgs_reconstructed, imgs_percept, imgs_percept_rendered, raw_data=raw_data)
 
 
     def configure_optimizers(self):
         # uORF = encoder -> slot attention -> decoder
         uorf_optimizer = optim.Adam(chain(
             self.netEncoder.parameters(), 
-            self.netSlotAttention.parameters(), 
+            self.netSlotAttention.parameters(),
             self.netDecoder.parameters()
             ), lr=self.opt.lr)
         
@@ -315,7 +444,7 @@ class uorfGanModel(pl.LightningModule):
         return [uorf_optimizer, disc_optimizer], [uorf_scheduler, disc_scheduler]
         
 
-    def log_visualizations(self, imgs: torch.Tensor, imgs_reconstructed: torch.Tensor, raw_data) -> None:
+    def log_visualizations(self, imgs: torch.Tensor, imgs_reconstructed: torch.Tensor, imgs_percept, imgs_percept_rendered, raw_data) -> None:
         # only tensorboard supported
         if self.trainer.is_global_zero and isinstance(self.logger, TensorBoardLogger):
             tensorboard = self.logger.experiment
@@ -344,7 +473,7 @@ class uorfGanModel(pl.LightningModule):
                     raws = b_masked_raws[0][k]
                     raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
                     z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
-                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                    rgb_map = render_image(raws, z_vals, ray_dir)
                     rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                     imgs_recon = rendered * 2 - 1
 
@@ -355,7 +484,7 @@ class uorfGanModel(pl.LightningModule):
                     raws = b_unmasked_raws[0][k]
                     raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
                     z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
-                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                    rgb_map = render_image(raws, z_vals, ray_dir)
                     rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                     imgs_recon = rendered * 2 - 1
 
@@ -374,3 +503,5 @@ class uorfGanModel(pl.LightningModule):
                     # Images from forward pass
                     tensorboard.add_image(f"out_imgs/{s}", tensor2im(imgs[s]).transpose(2, 0, 1), global_step=self.global_step)
                     tensorboard.add_image(f"out_imgs_recon/{s}", tensor2im(imgs_reconstructed[s]).transpose(2, 0, 1), global_step=self.global_step)
+                    tensorboard.add_image(f"out_imgs_percept/{s}", tensor2im(imgs_percept[s]).transpose(2, 0, 1), global_step=self.global_step)
+                    tensorboard.add_image(f"out_imgs_percept_recon/{s}", tensor2im(imgs_percept_rendered[s]).transpose(2, 0, 1), global_step=self.global_step)

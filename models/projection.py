@@ -90,7 +90,6 @@ class Projection(object):
             z_vals = z_vals.flatten(start_dim=1, end_dim=3)  # 4x(Nx(H/s)x(W/s))xD
         else:
             z_vals = z_vals.view(N, W, H, D).permute([0, 2, 1, 3]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xD
-
         # construct cam coord for ray_dir
         x = torch.arange(self.frustum_size[0])
         y = torch.arange(self.frustum_size[1])

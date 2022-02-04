@@ -155,8 +155,11 @@ class Decoder(nn.Module):
             z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
             input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
 
+            # Compute bg_raws
             tmp = self.b_before(input_bg)
             bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
+
+            # Compute fg_raws
             tmp = self.f_before(input_fg)
             tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
             latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
@@ -166,6 +169,7 @@ class Decoder(nn.Module):
                 fg_raw_shape[outsider_idx] *= 0
             fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
 
+            # Concat fg and bg raws
             all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
             raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
             masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
@@ -334,6 +338,39 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False):
         return rgb_map, depth_map, weights_norm, mask_map
 
     return rgb_map, depth_map, weights_norm
+
+
+def compute_render_weights(density, z_vals, rays_d):
+    assert z_vals.shape[0] == rays_d.shape[0] and \
+           density.shape[:2] == z_vals.shape[:2], \
+           f"{z_vals.shape[0]} != {rays_d.shape[0]} or {density.shape[:2]} != {z_vals.shape[:2]}"
+           
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    dists = torch.cat([dists, torch.tensor([1e-2]).type_as(z_vals).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples]
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+
+    alpha = 1. - torch.exp(-density * dists) # [N_rays, N_samples]
+    weights = alpha * torch.cumprod(
+        torch.cat(
+            [torch.ones((alpha.shape[0], 1)).type_as(z_vals), 1. - alpha + 1e-10], 
+            dim=-1
+        ), dim=-1)[:,:-1]
+    return weights
+
+
+def render_mask(raw, z_vals, rays_d):
+    density = raw[..., 3]  # [N_rays, N_samples]
+    weights = compute_render_weights(density, z_vals, rays_d)
+    mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
+    return mask_map
+
+
+def render_image(raw, z_vals, rays_d):
+    rgb = raw[..., :3]
+    density = raw[..., 3]  # [N_rays, N_samples]
+    weights = compute_render_weights(density, z_vals, rays_d)
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    return rgb_map 
 
 
 def get_perceptual_net(layer=4):
