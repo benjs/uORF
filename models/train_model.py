@@ -390,8 +390,10 @@ class uorfGanModel(pl.LightningModule):
         imgs = imgs.view(B*S, C, H, W)
         imgs_rendered = imgs_rendered.view(B*S, C, H, W)
         imgs_reconstructed = imgs_reconstructed.view(B*S, C, H, W)
-        imgs_percept = imgs_percept.view(B*S, C, 128, 128)
-        imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, 128, 128)
+
+        _, _, _, HP, WP = imgs_percept.shape
+        imgs_percept = imgs_percept.view(B*S, C, HP, WP)
+        imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, HP, WP)
 
         toggle_grad(self.netDisc, True)
         fake_pred = self.netDisc(imgs_reconstructed)
