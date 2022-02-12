@@ -564,7 +564,16 @@ class Discriminator(nn.Module):
             128: ndf//2
         }
 
-        convs = [ConvLayer(3, channels[size], 1, stride=1, padding=1)]
+        # Conv layer for different sized input (128**2) in fine training mode.
+        # Coarse input is 64**2
+        self.conv_large_input = nn.Sequential(
+            ConvLayer(3, 32, 1, stride=2, padding=0),
+            ConvLayer(32, channels[size], 1, stride=1, padding=1),
+        )
+        self.conv_small_input = ConvLayer(3, channels[size], 1, stride=1, padding=1)
+
+        # convs = [ConvLayer(3, channels[size], 1, stride=1, padding=1)]
+        convs = []
 
         log_size = int(math.log(size, 2))
 
@@ -589,6 +598,13 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, input):
+        _, _, H, W = input.shape
+
+        if H == 128:
+            input = self.conv_large_input(input)
+        else:
+            input = self.conv_small_input(input)
+
         out = self.convs(input) * 1.4
 
         batch, channel, height, width = out.shape

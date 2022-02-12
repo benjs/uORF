@@ -80,7 +80,7 @@ class uorfGanModel(pl.LightningModule):
         init_weights(self.netDecoder, init_type='xavier', init_gain=0.02)
 
         # Initialize discriminator for adverserial loss
-        self.netDisc = Discriminator(size=128, ndf=opt.ndf)
+        self.netDisc = Discriminator(size=self.opt.supervision_size, ndf=opt.ndf)
 
         # Loss module for reconstruction and perceptual loss
         self.L2_loss = nn.MSELoss()
@@ -279,6 +279,7 @@ class uorfGanModel(pl.LightningModule):
 
             imgs_percept = imgs_percept.view(B, S, C, 128, 128)
             imgs_percept_rendered = imgs_percept_rendered.view(B, N, 3, 128, 128)
+
 
         return imgs, imgs_rendered, imgs_percept, imgs_percept_rendered, \
             (masked_raws.detach(), unmasked_raws.detach(), z_vals, ray_dir, attn.detach())
