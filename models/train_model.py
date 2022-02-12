@@ -80,7 +80,7 @@ class uorfGanModel(pl.LightningModule):
         init_weights(self.netDecoder, init_type='xavier', init_gain=0.02)
 
         # Initialize discriminator for adverserial loss
-        self.netDisc = Discriminator(size=opt.supervision_size, ndf=opt.ndf)
+        self.netDisc = Discriminator(size=128, ndf=opt.ndf)
 
         # Loss module for reconstruction and perceptual loss
         self.L2_loss = nn.MSELoss()
@@ -350,7 +350,7 @@ class uorfGanModel(pl.LightningModule):
         imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, HP, WP)
 
         # Adverserial loss
-        d_fake = self.netDisc(imgs_reconstructed)
+        d_fake = self.netDisc(imgs_percept_rendered)
         loss_gan = self.weight_gan * g_nonsaturating_loss(d_fake)
 
         # Reconstruction loss
@@ -396,8 +396,8 @@ class uorfGanModel(pl.LightningModule):
         imgs_percept_rendered = imgs_percept_rendered.view(B*S, C, HP, WP)
 
         toggle_grad(self.netDisc, True)
-        fake_pred = self.netDisc(imgs_reconstructed)
-        real_pred = self.netDisc(imgs)
+        fake_pred = self.netDisc(imgs_percept_rendered)
+        real_pred = self.netDisc(imgs_percept)
 
         d_loss_real, d_loss_fake = d_logistic_loss(real_pred, fake_pred)
         d_loss = d_loss_real + d_loss_fake
@@ -408,9 +408,9 @@ class uorfGanModel(pl.LightningModule):
         disc_optimizer.step()
 
         if (batch_idx + 1) % 32 == 0:
-            imgs.requires_grad = True
-            real_pred = self.netDisc(imgs)
-            r1_loss = d_r1_loss(real_pred, imgs)
+            imgs_percept.requires_grad = True
+            real_pred = self.netDisc(imgs_percept)
+            r1_loss = d_r1_loss(real_pred, imgs_percept)
 
             disc_optimizer.zero_grad()
             self.manual_backward(self.opt.weight_r1 * r1_loss)
