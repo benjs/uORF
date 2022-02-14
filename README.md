@@ -11,7 +11,7 @@ This is a fork of the [original repository](https://github.com/KovenYu/uORF) wit
 We recommend using Conda:
 ```sh
 conda env create -f environment.yml
-conda activate uorf
+conda activate uorf-3090
 ```
 or install the packages listed therein. Please make sure you have NVIDIA drivers supporting CUDA 11.0, or modify the version specifictions in `environment.yml`.
 

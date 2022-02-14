@@ -1,4 +1,4 @@
-name: uorf
+name: uorf-3090
 channels:
   - pytorch
   - conda-forge
