@@ -1,6 +1,9 @@
 #!/bin/bash
-DATAROOT=${1:-'../data_uORF/room_diverse_test'}
+DATAROOT_HOME=${1:-"$HOME/data_uORF/room_diverse_test"}
 CHECKPOINT=${2:-'./'}
+
+DATAROOT={"$TMP/data"}
+cp -r $DATAROOT_HOME $DATAROOT
 
 python predict.py --train_dataroot "" --test_dataroot $DATAROOT --n_scenes 2 --n_img_each_scene 4 \
     --checkpoint $CHECKPOINT \

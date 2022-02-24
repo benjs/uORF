@@ -6,8 +6,9 @@ import torch.nn as nn
 
 Rays = namedtuple(
     'Rays',
-    ('origins', 'directions', 'viewdirs', 'radii', 'losstmult', 'near', 'far')
+    ('origins', 'directions', 'viewdirs', 'radii', 'lossmult', 'near', 'far')
 )
+
 
 class MipProjection:
     def __init__(
@@ -39,9 +40,12 @@ class MipProjection:
 
         xs, ys = torch.meshgrid(
             torch.arange(self.W, requires_grad=False),
-            torch.arange(self.H, requires_grad=False),
-            indexing="xy"
+            torch.arange(self.H, requires_grad=False)
         )
+        
+        # Torch 1.7.1 does not support indexing="xy"
+        xs = xs.transpose(0, 1)
+        ys = ys.transpose(0, 1)
 
         self.camera_dirs = torch.stack(
             [
@@ -58,8 +62,10 @@ class MipProjection:
     def get_rays(self, cam2world) -> Rays:
         S, _, _ = cam2world.shape  # [n_scenes, 4, 4]
 
+        camera_dirs = self.camera_dirs.type_as(cam2world)
+
         directions = (
-            self.camera_dirs[None, ..., None, :] * cam2world[:, None, None, :3, :3]
+            camera_dirs[None, ..., None, :] * cam2world[:, None, None, :3, :3]
         ).sum(dim=-1)  # [n_scenes, w, h, 3]
         viewdirs = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
         
@@ -84,16 +90,20 @@ class MipProjection:
 
 
 class MipNerf(nn.Module):
-    def __init__(self, ):
+    def __init__(self):
         super().__init__()
 
         self.mlp = MipMLP()
         self.num_samples = 64
         self.near = 6
         self.far = 20
-        self.max_exponent_point = 16
+        self.max_exponent_point = 5
+        self.rgb_activation = nn.Sigmoid()
+        self.density_activation = nn.Softplus()
+        self.rgb_padding = 0.001
+        self.density_bias = -1
 
-    def forward(self, rays: Rays):
+    def forward(self, rays: Rays, z_vals: torch.Tensor):
         t_vals, samples = sample_along_rays(
             rays.origins,
             rays.directions,
@@ -115,9 +125,66 @@ class MipNerf(nn.Module):
             self.max_exponent_point
         )  # [400, 2*3*max_exp + 3]
 
+        raw_rgb, raw_density = self.mlp(samples_enc, z_vals, viewdirs_enc)
+
+        rgb = self.rgb_activation(raw_rgb)
+        rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+
+        density = self.density_activation(raw_density + self.density_bias)
+
+        comp_rgb, distance, acc, weights = volumetric_rendering(
+            rgb,
+            density,
+            t_vals,
+            rays.directions,
+        )
+
+        return comp_rgb, distance, acc
+
+
+def volumetric_rendering(rgb, density, t_vals, dirs):
+    t_mids = 0.5 * (t_vals[..., :-1] + t_vals[..., 1:])
+    t_dists = t_vals[..., 1:] - t_vals[..., :-1]
+    delta = t_dists * torch.norm(dirs[..., None, :], dim=-1)
+    # Note that we're quietly turning density from [..., 0] to [...].
+    density_delta = density[..., 0] * delta
+    
+    alpha = 1 - torch.exp(-density_delta)
+    trans = torch.exp(
+        -torch.cat(
+            [
+                torch.zeros_like(density_delta[..., :1]),
+                torch.cumsum(density_delta[..., :-1], axis=-1)
+            ],
+            axis=-1
+        )
+    )
+    weights = alpha * trans
+
+    comp_rgb = (weights[..., None] * rgb).sum(axis=-2)
+    acc = weights.sum(axis=-1)
+    distance = (weights * t_mids).sum(axis=-1) / acc
+    distance = my_clip(
+        nan_to_num(distance, float("Inf")), 
+        t_vals[:, 0],
+        t_vals[:, -1]
+    )
+
+    return comp_rgb, distance, acc, weights
+    
+
+def nan_to_num(x: torch.Tensor, val: float = float("inf")):
+    return torch.where(torch.isnan(x), torch.ones_like(x)*val, x)
+
+
+def my_clip(x: torch.Tensor, min: torch.Tensor, max: torch.Tensor):
+    x = torch.where(x < min, min, x)
+    x = torch.where(x > max, max, x)
+    return x
+
 
 def pos_enc(x, min_exp, max_exp):
-    scales = 2 ** torch.arange(min_exp, max_exp)
+    scales = 2 ** torch.arange(min_exp, max_exp, device=x.device)
     shape = list(x.shape[:-1]) + [-1]
     xb = torch.reshape(x[..., None, :] * scales[:, None], shape)
     four_feat = torch.sin(
@@ -132,9 +199,10 @@ def pos_enc(x, min_exp, max_exp):
     )
     return four_feat
 
+
 def integrated_pos_enc(x_coord, min_exp, max_exp):
     x, x_cov_diag = x_coord
-    scales = 2 ** torch.arange(min_exp, max_exp)
+    scales = 2 ** torch.arange(min_exp, max_exp, device=x.device)
     shape = list(x.shape[:-1]) + [-1]
     y = torch.reshape(x[..., None, :] * scales[:, None], shape)
     y_var = torch.reshape(x_cov_diag[..., None, :] * scales[:, None]**2, shape)
@@ -179,7 +247,7 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far):
     """
     B = origins.shape[0]
 
-    t_vals = torch.linspace(0, 1, num_samples + 1)
+    t_vals = torch.linspace(0, 1, num_samples + 1, device=directions.device)
     t_vals = near * (1 - t_vals) + far * t_vals
     t_vals = t_vals.expand(B, -1)
 
@@ -222,11 +290,11 @@ def lift_gaussian(directions, t_mean, t_var, r_var):
 
 
 class MipMLP(nn.Module):
-    def __init__(self, mlp_num_features=64, input_features=30, condition_num_features: int = 33):
+    def __init__(self, mlp_num_features=64, input_features=30, z_vals_features=64, condition_num_features: int = 33):
         super().__init__()
 
         self.before_skip = nn.Sequential(
-            nn.Linear(in_features=input_features, out_features=mlp_num_features),
+            nn.Linear(in_features=input_features+z_vals_features, out_features=mlp_num_features),
             nn.ReLU(inplace=True),
             nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
             nn.ReLU(inplace=True),
@@ -235,7 +303,10 @@ class MipMLP(nn.Module):
         )
 
         self.after_skip = nn.Sequential(
-            nn.Linear(in_features=mlp_num_features + input_features, out_features=mlp_num_features),
+            nn.Linear(
+                in_features=mlp_num_features + input_features + z_vals_features,
+                out_features=mlp_num_features
+            ),
             nn.ReLU(inplace=True),
             nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
             nn.ReLU(inplace=True),
@@ -246,7 +317,7 @@ class MipMLP(nn.Module):
         self.to_density = nn.Linear(in_features=mlp_num_features, out_features=1)
         
         self.condition_bottleneck = nn.Linear(
-            in_features=condition_num_features,
+            in_features=mlp_num_features,
             out_features=mlp_num_features
         )
 
@@ -260,12 +331,19 @@ class MipMLP(nn.Module):
 
         self.to_rgb = nn.Linear(in_features=mlp_num_features // 2, out_features=3)
 
-    def forward(self, inputs: torch.Tensor, condition: torch.Tensor):
-        batch_size, num_samples, _ = inputs.shape  # [batch size, num samples, features]
+    def forward(self, x: torch.Tensor, z_vals: torch.Tensor, condition: torch.Tensor):
+        batch_size, num_samples, _ = x.shape  # [batch size, num samples, features]
+        assert z_vals.shape[0] == batch_size, \
+            f"z_vals has to be of shape [{batch_size}, z_feat], but {list(z_vals.shape)} was given."
 
-        x = input
+        # Repeat z_vals for each batch input: [batch_size, z_feat] -> [batch_size, num_samples, z_feat]
+        z_vals = z_vals[:, None, :].repeat(1, num_samples, 1)
+        z_vals = z_vals.view(batch_size * num_samples, z_vals.shape[-1])  # [batch_size*num_samples, z_feat]
+
         x = x.view(batch_size * num_samples, x.shape[-1])
-        x = self.before_skip(x)
+        inputs = torch.cat((x, z_vals), dim=-1)
+
+        x = self.before_skip(inputs)
         x = torch.cat([x, inputs], dim=-1)
         x = self.after_skip(x)
 
@@ -286,3 +364,19 @@ class MipMLP(nn.Module):
 
         return raw_rgb, raw_density
 
+
+class uorfMipNerf(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.fg_nerf = MipNerf()
+        self.bg_nerf = MipNerf()
+    
+    def forward(self, z_vals: torch.Tensor, rays: Rays):
+        B, K, C = z_vals.shape
+        bg_z_vals = z_vals[:, :1, :].view(B, C)
+        fg_z_vals = z_vals[:, 1:, :].view(B * (K-1), C)
+
+        bg_rgb, _, _ = self.bg_nerf(rays, bg_z_vals)
+
+        fg_rgb, _, _ = self.fg_nerf(rays, fg_z_vals)

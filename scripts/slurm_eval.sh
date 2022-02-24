@@ -14,7 +14,7 @@
 
 echo 'Activate conda environment'
 source ~/.bashrc
-conda activate uorf-3090
+conda activate uorf
 
 echo 'Start evaluation'
 exec scripts/eval.sh

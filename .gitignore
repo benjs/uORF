@@ -4,3 +4,4 @@ checkpoints
 slurm-*
 __pycache__
 venv/
+.ipynb_checkpoints

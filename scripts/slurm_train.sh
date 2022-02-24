@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=uORF
+#SBATCH --job-name=uORF-mip
 #SBATCH --ntasks=1
 #SBATCH --time=19:00:00
 
@@ -18,7 +18,7 @@
 
 echo 'Activate conda environment'
 source ~/.bashrc
-conda activate uorf-3090
+conda activate uorf
 
 echo 'Start training'
 exec scripts/train.sh

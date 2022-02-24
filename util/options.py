@@ -1,6 +1,6 @@
 import argparse
 
-def parse_custom_options():
+def parse_custom_options(args=None):
     """Removed unnecessary arguments from original implementation"""
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
@@ -97,7 +97,7 @@ def parse_custom_options():
     parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                         dataset_mode='multiscenes', niter=240, custom_lr=True, lr_policy='warmup')
 
-    opt = parser.parse_args()
+    opt = parser.parse_args(args)
     print_options(parser, opt)
 
     return opt
