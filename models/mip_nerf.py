@@ -79,67 +79,15 @@ class MipProjection:
         ones = torch.ones_like(origins[..., :1])
 
         return Rays(
-            origins=origins.flatten(end_dim=-2),
-            directions=directions.flatten(end_dim=-2),
-            viewdirs=viewdirs.flatten(end_dim=-2),
-            radii=radii.flatten(end_dim=-2),
-            lossmult=ones.flatten(end_dim=-2),
-            near=ones.flatten(end_dim=-2) * self.near,
-            far=ones.flatten(end_dim=-2) * self.far
+            origins=origins.flatten(start_dim=1, end_dim=-2),  # [n_scenes, w*h, 3]
+            directions=directions.flatten(start_dim=1, end_dim=-2),  # [n_scenes, w*h, 3]
+            viewdirs=viewdirs.flatten(start_dim=1, end_dim=-2),  # [n_scenes, w*h, 3]
+            radii=radii.flatten(start_dim=1, end_dim=-2),  # [n_scenes, w*h, 3]
+            lossmult=ones.flatten(start_dim=1, end_dim=-2),  # [n_scenes, w*h, 1]
+            near=ones.flatten(start_dim=1, end_dim=-2) * self.near,  # [n_scenes, w*h, 1]
+            far=ones.flatten(start_dim=1, end_dim=-2) * self.far  # [n_scenes, w*h, 1]
         )
 
-
-class MipNerf(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.mlp = MipMLP()
-        self.num_samples = 64
-        self.near = 6
-        self.far = 20
-        self.max_exponent_point = 5
-        self.rgb_activation = nn.Sigmoid()
-        self.density_activation = nn.Softplus()
-        self.rgb_padding = 0.001
-        self.density_bias = -1
-
-    def forward(self, rays: Rays, z_vals: torch.Tensor):
-        t_vals, samples = sample_along_rays(
-            rays.origins,
-            rays.directions,
-            rays.radii,
-            self.num_samples,
-            rays.near,
-            rays.far
-        )
-
-        samples_enc = integrated_pos_enc(
-            samples,
-            0,
-            self.max_exponent_point
-        )
-
-        viewdirs_enc = pos_enc(
-            rays.viewdirs,
-            0,
-            self.max_exponent_point
-        )  # [400, 2*3*max_exp + 3]
-
-        raw_rgb, raw_density = self.mlp(samples_enc, z_vals, viewdirs_enc)
-
-        rgb = self.rgb_activation(raw_rgb)
-        rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
-
-        density = self.density_activation(raw_density + self.density_bias)
-
-        comp_rgb, distance, acc, weights = volumetric_rendering(
-            rgb,
-            density,
-            t_vals,
-            rays.directions,
-        )
-
-        return comp_rgb, distance, acc
 
 
 def volumetric_rendering(rgb, density, t_vals, dirs):
@@ -365,18 +313,129 @@ class MipMLP(nn.Module):
         return raw_rgb, raw_density
 
 
-class uorfMipNerf(nn.Module):
+
+class MipNerf(nn.Module):
     def __init__(self):
         super().__init__()
 
+        self.mlp = MipMLP()
+        self.num_samples = 64
+        self.near = 6
+        self.far = 20
+        self.max_exponent_point = 5
+        self.rgb_activation = nn.Sigmoid()
+        self.density_activation = nn.Softplus()
+        self.rgb_padding = 0.001
+        self.density_bias = -1
+
+    def forward(self, rays: Rays, z_vals: torch.Tensor):
+        n_scenes, n_rays, _ = rays.origins.shape  # [n_scenes, n_rays, 3]
+        _, n_slots, _ = z_vals.shape  # [n_scenes, n_slots, n_channels]
+        # Note: n_slots is 1 for bg and 4 for fg nerf
+
+        # t_vals: [n_scenes * n_rays, n_samples + 1]
+        # samples:
+        #   mean: [n_scenes * n_rays, n_samples, 3]
+        #   cov:  [n_scenes * n_rays, n_samples, 3]  (diagonal cov)
+        t_vals, samples = sample_along_rays(
+            rays.origins.flatten(end_dir=-2),
+            rays.directions.flatten(end_dir=-2),
+            rays.radii.flatten(end_dir=-2),
+            self.num_samples,
+            rays.near.flatten(end_dir=-2),
+            rays.far.flatten(end_dir=-2)
+        )
+
+        samples_enc = integrated_pos_enc(
+            samples,
+            0,
+            self.max_exponent_point
+        )  # [n_scenes * n_rays, n_samples, 2*3*max_exp]
+
+        viewdirs_enc = pos_enc(
+            rays.viewdirs,
+            0,
+            self.max_exponent_point
+        )  # [n_scenes * n_rays, 2*3*max_exp + 3]
+
+        # Prepare for expanding
+        samples_enc = samples_enc.view(n_scenes, 1, n_rays, self.num_samples, -1)
+        viewdirs_enc = viewdirs_enc.view(n_scenes, 1, n_rays, -1)
+        t_vals = t_vals.view(n_scenes, 1, n_rays, -1)
+        z_vals = z_vals.view(n_scenes, n_slots, 1, -1)
+
+        # Expand rays for each scene by the number of slots
+        samples_enc = samples_enc.expand(-1, n_slots, -1, -1, -1)
+        viewdirs_enc = viewdirs_enc.expand(-1, n_slots, -1, -1)
+        t_vals = t_vals.expand(-1, n_slots, -1, -1)
+
+        # Expand slots for each scene by number of rays
+        z_vals = z_vals.expand(-1, -1, n_rays, -1)
+
+        # Flatten
+        B = n_scenes*n_slots*n_rays
+        samples_enc = samples_enc.view(B, self.num_samples, -1)
+        viewdirs_enc = viewdirs_enc.view(B, -1)
+        t_vals = t_vals.view(B, -1)
+        z_vals = z_vals.view(B, -1)
+
+        raw_rgb, raw_density = self.mlp(samples_enc, z_vals, viewdirs_enc)
+
+        rgb = self.rgb_activation(raw_rgb)
+        rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+
+        density = self.density_activation(raw_density + self.density_bias)
+
+        # comp_rgb: [B, 3]
+        # distance: [B]
+        # acc: [B]
+        # weights: [B, num_samples]
+        # comp_rgb, distance, acc, weights = volumetric_rendering(
+        #     rgb,
+        #     density,
+        #     t_vals,
+        #     rays.directions,
+        # )
+
+        return raw_rgb, raw_density  # [B, num_samples, 3], [B, num_samples, 1]
+
+
+class uorfMipNerf(nn.Module):
+    def __init__(self):
+        super().__init__()
         self.fg_nerf = MipNerf()
         self.bg_nerf = MipNerf()
     
     def forward(self, z_vals: torch.Tensor, rays: Rays):
-        B, K, C = z_vals.shape
-        bg_z_vals = z_vals[:, :1, :].view(B, C)
-        fg_z_vals = z_vals[:, 1:, :].view(B * (K-1), C)
+        n_scenes, _, _ = rays.origins.shape  # [n_scenes, n_rays, 3]
+        _, n_slots, _ = z_vals.shape  # [n_scenes, n_slots, n_channels]
 
-        bg_rgb, _, _ = self.bg_nerf(rays, bg_z_vals)
+        bg_z_vals = z_vals[:, :1, :]  # [n_scenes, 1, n_channels]
+        fg_z_vals = z_vals[:, 1:, :]  # [n_scenes, n_slots - 1, n_channels]
 
-        fg_rgb, _, _ = self.fg_nerf(rays, fg_z_vals)
+        # Run foreground and background NeRF
+        bg_raw_rgb, bg_raw_density = self.bg_nerf(rays, bg_z_vals)
+        fg_raw_rgb, fg_raw_density = self.fg_nerf(rays, fg_z_vals)
+
+        assert self.bg_nerf.num_samples == self.fg_nerf.num_samples
+        n_samples = self.bg_nerf.num_samples
+
+        # Prepare concat
+        bg_raw_rgb = bg_raw_rgb.view(n_scenes, 1, n_samples, 3)
+        bg_raw_density = bg_raw_density.view(n_scenes, 1, n_samples, 1)
+        fg_raw_rgb = fg_raw_rgb.view(n_scenes, n_slots-1, n_samples, 3)
+        fg_raw_density = fg_raw_density.view(n_scenes, n_slots-1, n_samples, 1)
+
+        # Concat results in slots dimension
+        raw_rgb = torch.cat((bg_raw_rgb, fg_raw_rgb), dim=1)  # [n_scenes, n_slots, n_samples, 3]
+        raw_density = torch.cat((bg_raw_density, fg_raw_density), dim=1)  # [n_scenes, n_slots, n_samples, 1]
+        raws = torch.cat((raw_rgb, raw_density), dim=-1)
+
+        # Weight raws depending on density
+        weights = raw_density / (torch.sum(raw_density, dim=1, keepdim=True) + 1e-5)
+        weighted_raws = raws * weights
+
+        # Sum over slots
+        combined_raws = weighted_raws.sum(dim=1)
+
+        return combined_raws, weighted_raws, raws
