@@ -11,6 +11,8 @@ from models.model import Decoder, Discriminator, Encoder, SlotAttention, d_logis
 from models.helper import get_scheduler, init_weights
 from models.projection import Projection
 
+import models.mip_nerf as mip
+
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from util.util import tensor2im
@@ -34,16 +36,24 @@ class uorfGanModel(pl.LightningModule):
         # Frustum
         render_size = (opt.render_size, opt.render_size)
         frustum_size = [opt.frustum_size, opt.frustum_size, opt.n_samp]
-        self.projection = Projection(
-            device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size, 
-            near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+        # self.projection = Projection(
+        #     device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size, 
+        #     near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+        self.projection = mip.MipProjection(
+            frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane, nss_scale=opt.nss_scale
+        )
 
         # Projections for fine training on small section of original image
         frustum_size_fine = [opt.frustum_size_fine, opt.frustum_size_fine, opt.n_samp]
-        self.projection_fine = Projection(
-            device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size_fine, 
-            near=opt.near_plane, far=opt.far_plane, render_size=render_size)
-        
+        # self.projection_fine = Projection(
+        #     device=self.device, nss_scale=opt.nss_scale, frustum_size=frustum_size_fine, 
+        #     near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+
+        self.projection_fine = mip.MipProjection(
+            frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane, nss_scale=opt.nss_scale
+        )
+
+
         # Slot attention noise dim and number of slots
         z_dim = opt.z_dim
         self.num_slots = opt.num_slots
@@ -58,10 +68,11 @@ class uorfGanModel(pl.LightningModule):
         init_weights(self.netSlotAttention, init_type='normal', init_gain=0.02)
 
         # Initialize nerf decoder network
-        self.netDecoder = Decoder(
-            n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, 
-            n_layers=opt.n_layer, locality_ratio=opt.obj_scale/opt.nss_scale, 
-            fixed_locality=opt.fixed_locality)
+        # self.netDecoder = Decoder(
+        #     n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, 
+        #     n_layers=opt.n_layer, locality_ratio=opt.obj_scale/opt.nss_scale, 
+        #     fixed_locality=opt.fixed_locality)
+        self.netDecoder = mip.MipNerf()
         init_weights(self.netDecoder, init_type='xavier', init_gain=0.02)
 
         # Initialize discriminator for adverserial loss
@@ -98,67 +109,88 @@ class uorfGanModel(pl.LightningModule):
 
         # Use full image for training, resize to supervision size
         if self.opt.stage == 'coarse':
-            frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
+            #frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            rays = self.projection.get_rays(cam2world)
 
             imgs = F.interpolate(
                 imgs, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
 
             # Bring back batch dimension
             W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
-            frus_nss_coor = frus_nss_coor.view([B, S*D*H*W, 3])
-            z_vals, ray_dir =  z_vals.view([B, S*H*W, D]), ray_dir.view([B, S*H*W, 3])
+            # frus_nss_coor = frus_nss_coor.view([B, S*D*H*W, 3])
+            # z_vals, ray_dir =  z_vals.view([B, S*H*W, D]), ray_dir.view([B, S*H*W, 3])
 
         # Use part of image for finer training
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp  
-            frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
+            # frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            rays = self.projection_fine.get_rays(cam2world)
 
             # Bring back batch dimension
-            frus_nss_coor = frus_nss_coor.view([B, S, D, H, W, 3])
-            z_vals, ray_dir = z_vals.view([B, S, H, W, D]), ray_dir.view([B, S, H, W, 3])
+            # frus_nss_coor = frus_nss_coor.view([B, S, D, H, W, 3])
+            # z_vals, ray_dir = z_vals.view([B, S, H, W, D]), ray_dir.view([B, S, H, W, 3])
 
             # Cut out part of image
             start_range = self.opt.frustum_size_fine - self.opt.render_size
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=self.device)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=self.device)
 
-            rs = self.opt.render_size
-            frus_nss_coor_= frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            z_vals_  = z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            ray_dir_ = ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
+        # return Rays(
+        #     origins=origins,  # [n_scenes, w, h, 3]
+        #     directions=directions,  # [n_scenes, w, h, 3]
+        #     viewdirs=viewdirs,  # [n_scenes, w, h, 3]
+        #     radii=radii,  # [n_scenes, w, h, 3]
+        #     lossmult=ones,  # [n_scenes, w, h, 1]
+        #     near=ones * self.near,  # [n_scenes, w, h, 1]
+        #     far=ones * self.far  # [n_scenes, w, h, 1]
+        # )
 
-            frus_nss_coor = frus_nss_coor_.flatten(1, 4)
-            z_vals, ray_dir = z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
+            rs = self.opt.render_size
+            rays.origins = rays.origins[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.directions = rays.directions[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.viewdirs = rays.viewdirs[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.radii = rays.radii[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.lossmult = rays.lossmult[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.near = rays.near[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays.far = rays.far[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
+            # frus_nss_coor_= frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            # z_vals_  = z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            # ray_dir_ = ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            # imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
+
+            # frus_nss_coor = frus_nss_coor_.flatten(1, 4)
+            # z_vals, ray_dir = z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
 
         # Repeat sampling coordinates for each object (K-1 objects, one background), P = S*D*H*W
-        sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # B×(K-1)xPx3
-        sampling_coor_bg = frus_nss_coor  # B×Px3
+        # sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # B×(K-1)xPx3
+        # sampling_coor_bg = frus_nss_coor  # B×Px3
 
         # Run decoder
-        raws, masked_raws, unmasked_raws, masks = self.netDecoder(
-            sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  
+        combined_raws, weighted_raws, raws, t_vals = self.netDecoder(z_slots, rays)  
         # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4,  (Kx(NxDxHxW)x1 <- masks, not needed)
 
         # Reshape for further processing
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
         imgs = imgs.view(B, S, C, H, W)
-        raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # B×(NxHxW)xDx4
-        masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
-        unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])
-        
-        rgb_maps = []
-        for i in range(B):
-            rgb_map, _, _ = raw2outputs(raws[i], z_vals[i], ray_dir[i])
-            rgb_maps.append(rgb_map)
-            # (NxHxW)x3, (NxHxW)
-        rgb_map_out = torch.stack(rgb_maps)
+        # raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # B×(NxHxW)xDx4
+        # masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
+        # unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])
+                
+        rgbs = combined_raws[..., :3]
+        densitys = combined_raws[..., 3:4]
+        comp_rgb, distance, acc, weights = mip.volumetric_rendering(
+            rgbs,
+            densitys,
+            t_vals,
+            rays.directions.flatten(end_dim=-2)
+        )
 
-        img_rendered = rgb_map_out.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # B×Nx3xHxW
-        return imgs, img_rendered, \
-            (masked_raws.detach(), unmasked_raws.detach(), z_vals, ray_dir, attn.detach())
+        img_rendered = comp_rgb.view(N, H, W, 3)
+
+        return imgs, img_rendered, attn.detach()
 
 
     def on_epoch_start(self) -> None:
@@ -335,42 +367,44 @@ class uorfGanModel(pl.LightningModule):
 
             with torch.no_grad():
                 # Compute visuals from batched raw data
-                b_masked_raws, b_unmasked_raws, b_z_vals, b_ray_dir, b_attn = raw_data
-                B, K, N, D, H, W, _ = b_masked_raws.shape
+                # b_masked_raws, b_unmasked_raws, b_z_vals, b_ray_dir, b_attn = raw_data
+                b_attn = raw_data
+                B, K, _ = b_attn.shape
+                # B, K, N, D, H, W, _ = b_masked_raws.shape
                 
                 # iterate slots, only display first batch
                 for k in range(K):
                     # Render images from masked raws
-                    raws = b_masked_raws[0][k]
-                    raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
-                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
-                    rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                    imgs_recon = rendered * 2 - 1
+                    # raws = b_masked_raws[0][k]
+                    # raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                    # z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
+                    # rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                    # rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                    # imgs_recon = rendered * 2 - 1
 
-                    for i in range(N):
-                        tensorboard.add_image(f"masked/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
+                    # for i in range(N):
+                    #     tensorboard.add_image(f"masked/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
 
-                    # Render images from unmasked raws
-                    raws = b_unmasked_raws[0][k]
-                    raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
-                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
-                    rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                    imgs_recon = rendered * 2 - 1
+                    # # Render images from unmasked raws
+                    # raws = b_unmasked_raws[0][k]
+                    # raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                    # z_vals, ray_dir = b_z_vals[0], b_ray_dir[0]
+                    # rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                    # rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                    # imgs_recon = rendered * 2 - 1
 
-                    for i in range(N):
-                        tensorboard.add_image(f"unmasked/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
+                    # for i in range(N):
+                    #     tensorboard.add_image(f"unmasked/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
 
-                        # Render reconstructed images (whole scene)
-                        tensorboard.add_image(f"recon/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
+                    #     # Render reconstructed images (whole scene)
+                    #     tensorboard.add_image(f"recon/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
 
                     # Render attention
-                    b_attn = b_attn.view(B, K, 1, H, W)
+                    b_attn = b_attn.view(B, K, 1, 64, 64)
                     tensorboard.add_image(f"attn/{k}", tensor2im(b_attn[0][k]*2 - 1 ).transpose(2, 0, 1), global_step=self.global_step)
 
                 # iterate scenes
-                for s in range(N):
+                for s in range(self.opt.n_img_each_scene):
                     # Images from forward pass
                     tensorboard.add_image(f"out_imgs/{s}", tensor2im(imgs[s]).transpose(2, 0, 1), global_step=self.global_step)
                     tensorboard.add_image(f"out_imgs_recon/{s}", tensor2im(imgs_reconstructed[s]).transpose(2, 0, 1), global_step=self.global_step)
