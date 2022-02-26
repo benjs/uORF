@@ -397,7 +397,7 @@ class MipNerf(nn.Module):
         #     rays.directions,
         # )
 
-        return raw_rgb, raw_density  # [B, num_samples, 3], [B, num_samples, 1]
+        return rgb, density, t_vals  # [B, num_samples, 3], [B, num_samples, 1]
 
 
 class uorfMipNerf(nn.Module):
@@ -414,8 +414,8 @@ class uorfMipNerf(nn.Module):
         fg_z_vals = z_vals[:, 1:, :]  # [n_scenes, n_slots - 1, n_channels]
 
         # Run foreground and background NeRF
-        bg_raw_rgb, bg_raw_density = self.bg_nerf(rays, bg_z_vals)
-        fg_raw_rgb, fg_raw_density = self.fg_nerf(rays, fg_z_vals)
+        bg_raw_rgb, bg_raw_density, t_vals = self.bg_nerf(rays, bg_z_vals)
+        fg_raw_rgb, fg_raw_density, _ = self.fg_nerf(rays, fg_z_vals)
 
         assert self.bg_nerf.num_samples == self.fg_nerf.num_samples
         n_samples = self.bg_nerf.num_samples
@@ -436,6 +436,6 @@ class uorfMipNerf(nn.Module):
         weighted_raws = raws * weights
 
         # Sum over slots
-        combined_raws = weighted_raws.sum(dim=1)
+        combined_raws = weighted_raws.sum(dim=1)  # [n_scenes, n_samples, 4]
 
         return combined_raws, weighted_raws, raws
