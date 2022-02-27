@@ -103,7 +103,10 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-    def forward(self, batched_sampling_coor_bg, batched_sampling_coor_fg, batched_z_slots, batched_fg_transform):
+        self.align_condition = nn.Linear(z_dim + 3, z_dim)
+        self.after_condition = nn.Linear(z_dim, z_dim)
+
+    def forward(self, batched_sampling_coor_bg, batched_sampling_coor_fg, batched_z_slots, batched_fg_transform, batched_view_dir):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -131,6 +134,7 @@ class Decoder(nn.Module):
             sampling_coor_fg = batched_sampling_coor_fg[i]
             z_slots = batched_z_slots[i]
             fg_transform = batched_fg_transform[i]
+            view_dir = batched_view_dir[i]
 
             K, C = z_slots.shape
             P = sampling_coor_bg.shape[0]
@@ -140,10 +144,18 @@ class Decoder(nn.Module):
                 sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
                 sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
                 sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
+
+                view_dir = torch.cat([view_dir, torch.ones_like(view_dir[:, :, 0:1])], dim=-1)
+                view_dir = torch.matmul(fg_transform[None, ...], view_dir[..., None]) # [n_scenes, n_rays, 4]
+                view_dir = view_dir.squeeze(-1)[..., :3].flatten(0, 1)  # [n_scenes*n_rays, 3]
+
             else:
                 sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
                 sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
                 outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+
+                view_dir = torch.matmul(fg_transform[None, ...], view_dir[..., None])
+                view_dir = view_dir.squeeze(-1).flatten(0, 1)  # [n_scenes*n_rays, 3]
 
             z_bg = z_slots[0:1, :]  # 1xC
             z_fg = z_slots[1:, :]  # (K-1)xC
@@ -158,8 +170,13 @@ class Decoder(nn.Module):
             tmp = self.b_before(input_bg)
             bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
             tmp = self.f_before(input_fg)
-            tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
-            latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
+            tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)*P)x64
+            latent_fg = self.f_after_latent(tmp)  # ((K-1)*P)x64
+
+            # Condition on view_dir
+            latent_fg = self.align_condition(torch.cat([latent_fg, view_dir], dim=-1))
+            latent_fg = self.after_condition(latent_fg)
+
             fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
             fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
             if self.locality:

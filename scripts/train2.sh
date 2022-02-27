@@ -4,7 +4,6 @@
 DATAFILE_HOME=${1:-'../data_uORF/1200shape_50bg.tar.gz'}
 DATAROOT="$TMP/data"
 DATAFILE="$TMP/data.tar.gz"
-mkdir $DATAROOT
 
 if [ -d "$DATAROOT" ]; then
     echo "$DATAROOT already exists."
@@ -19,8 +18,8 @@ else
 fi
 
 python train.py --train_dataroot $DATAROOT  --test_dataroot "" \
-    --n_scenes 5000 --n_img_each_scene 4 --display_grad --display_freq 1000 \
-    --load_size 128 --n_samp 64 --input_size 128 --supervision_size 64 --coarse_epoch 120 \
+    --n_scenes 10 --n_img_each_scene 4 --display_grad \
+    --load_size 128 --n_samp 64 --input_size 128 --supervision_size 64 --coarse_epoch 0 \
     --no_locality_epoch 60 --z_dim 64 --num_slots 5 --bottom \
     --batch_size 1 --num_threads 10 \
 

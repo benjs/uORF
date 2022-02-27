@@ -100,14 +100,25 @@ class uorfGanModel(pl.LightningModule):
         if self.opt.stage == 'coarse':
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            # print("before", ray_dir[0])
+            # print("trafo", cam2world[0])
+            # print(ray_dir.shape, cam2world.shape)
+            # print(ray_dir.view(H*W, 3).expand(N, -1, -1)[..., None, :].shape, cam2world[:, None, :3, :3].shape)
+            # print(view_dir.shape)
+            # print("after", view_dir[0, 0])
 
             imgs = F.interpolate(
                 imgs, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
 
             # Bring back batch dimension
             W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
+
+            view_dir = (ray_dir.view(N, H*W, 3)[..., None, :] * cam2world[:, None, :3, :3]).sum(axis=-1)  # [N, H*W. 3]
+            view_dir = view_dir.view(N, 1, H*W, 3).repeat(1, D, 1, 1)  # repeat for samples
+
             frus_nss_coor = frus_nss_coor.view([B, S*D*H*W, 3])
             z_vals, ray_dir =  z_vals.view([B, S*H*W, D]), ray_dir.view([B, S*H*W, 3])
+            view_dir = view_dir.view(B, S*D*H*W, 3)
 
         # Use part of image for finer training
         else:
@@ -115,9 +126,13 @@ class uorfGanModel(pl.LightningModule):
             frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
 
+            view_dir = (ray_dir.view(N, H*W, 3)[..., None, :] * cam2world[:, None, :3, :3]).sum(axis=-1)
+            view_dir = view_dir.view(B, S*H*W, 3).repeat(1, D, 1)  # [B, D * S*H*W, 3]
+
             # Bring back batch dimension
             frus_nss_coor = frus_nss_coor.view([B, S, D, H, W, 3])
             z_vals, ray_dir = z_vals.view([B, S, H, W, D]), ray_dir.view([B, S, H, W, 3])
+            view_dir = view_dir.view([B, D, S, H, W, 3]).permute(0, 2, 1, 3, 4, 5)  # same ordering as frus_nss_coor
 
             # Cut out part of image
             start_range = self.opt.frustum_size_fine - self.opt.render_size
@@ -128,18 +143,26 @@ class uorfGanModel(pl.LightningModule):
             frus_nss_coor_= frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             z_vals_  = z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             ray_dir_ = ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            view_dir_ = view_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
 
             frus_nss_coor = frus_nss_coor_.flatten(1, 4)
             z_vals, ray_dir = z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
+            view_dir = view_dir_.flatten(1, 4)
 
         # Repeat sampling coordinates for each object (K-1 objects, one background), P = S*D*H*W
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # B×(K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # B×Px3
 
+        view_dir = view_dir[:, None, ...].expand(-1, K-1, -1, -1)  # B×(K-1)xPx3
+
+        # vd = view_dir.view(B, K-1, S, D, H, W, 3)
+        # print("D", vd[0, 0, 0, 0, 0, 0], vd[0, 0, 0, D-1, 0, 0])
+        # print("K", vd[0, 0, 0, 0, 0, 0], vd[0, 1, 0, 0, 0, 0])
+
         # Run decoder
         raws, masked_raws, unmasked_raws, masks = self.netDecoder(
-            sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  
+            sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, view_dir)  
         # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4,  (Kx(NxDxHxW)x1 <- masks, not needed)
 
         # Reshape for further processing
