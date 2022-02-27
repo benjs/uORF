@@ -72,7 +72,7 @@ class uorfGanModel(pl.LightningModule):
         #     n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, 
         #     n_layers=opt.n_layer, locality_ratio=opt.obj_scale/opt.nss_scale, 
         #     fixed_locality=opt.fixed_locality)
-        self.netDecoder = mip.MipNerf()
+        self.netDecoder = mip.uorfMipNerf()
         init_weights(self.netDecoder, init_type='xavier', init_gain=0.02)
 
         # Initialize discriminator for adverserial loss
@@ -148,13 +148,15 @@ class uorfGanModel(pl.LightningModule):
         # )
 
             rs = self.opt.render_size
-            rays.origins = rays.origins[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.directions = rays.directions[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.viewdirs = rays.viewdirs[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.radii = rays.radii[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.lossmult = rays.lossmult[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.near = rays.near[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            rays.far = rays.far[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            rays = mip.Rays(
+                origins=rays.origins[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                directions=rays.directions[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                viewdirs=rays.viewdirs[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                radii=rays.radii[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                lossmult=rays.lossmult[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                near=rays.near[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :],
+                far=rays.far[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
+            )
             imgs = imgs[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
             # frus_nss_coor_= frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             # z_vals_  = z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
@@ -178,7 +180,15 @@ class uorfGanModel(pl.LightningModule):
         # raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # B×(NxHxW)xDx4
         # masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
         # unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])
-                
+        
+        n_scenes, n_rays, n_samples, _ = combined_raws.shape
+        combined_raws = combined_raws.flatten(0, 1) # [n_scenes, n_rays, n_samples, 4]
+        rgbs = combined_raws[..., :3]  # [n_scenes, n_rays, n_samples, 3]
+        densities = combined_raws[..., 3:4]  # [n_scenes, n_rays, n_samples, 1]
+        directions = rays.directions  # [n_scenes, w, h, 3]
+        # print("dir", directions.shape)
+        # print(rgbs.shape, densities.shape, t_vals.shape, directions.shape)
+
         rgbs = combined_raws[..., :3]
         densitys = combined_raws[..., 3:4]
         comp_rgb, distance, acc, weights = mip.volumetric_rendering(
@@ -188,9 +198,20 @@ class uorfGanModel(pl.LightningModule):
             rays.directions.flatten(end_dim=-2)
         )
 
-        img_rendered = comp_rgb.view(N, H, W, 3)
+        img_rendered = comp_rgb.view(N, H, W, 3).permute(0, 3, 1, 2)  # [N, H, W, 3]
 
-        return imgs, img_rendered, attn.detach()
+        # comp_rgbs = []
+        # for i in range(n_scenes):
+        #     comp_rgb, distance, acc, weights = mip.volumetric_rendering(
+        #         rgbs[i],
+        #         densities[i],
+        #         t_vals.view(n_scenes, n_rays, -1)[i],
+        #         directions[i].flatten(end_dim=-2)
+        #     )
+        #     comp_rgbs.append(comp_rgb)
+        # img_rendered = torch.cat(comp_rgbs).view(N, H, W, 3)
+
+        return imgs, img_rendered, (weighted_raws, raws, t_vals, directions, attn.detach())
 
 
     def on_epoch_start(self) -> None:
@@ -368,7 +389,8 @@ class uorfGanModel(pl.LightningModule):
             with torch.no_grad():
                 # Compute visuals from batched raw data
                 # b_masked_raws, b_unmasked_raws, b_z_vals, b_ray_dir, b_attn = raw_data
-                b_attn = raw_data
+                (weighted_raws, raws, t_vals, directions, b_attn) = raw_data
+
                 B, K, _ = b_attn.shape
                 # B, K, N, D, H, W, _ = b_masked_raws.shape
                 
@@ -398,6 +420,41 @@ class uorfGanModel(pl.LightningModule):
 
                     #     # Render reconstructed images (whole scene)
                     #     tensorboard.add_image(f"recon/{k}_{i}", tensor2im(imgs_recon[i]).transpose(2, 0, 1), global_step=self.global_step)
+                    n_scenes, n_slots, n_rays, n_samples, _ = weighted_raws.shape
+                    t_vals = t_vals.view(n_scenes, n_rays, 65)
+                    directions = directions.reshape(n_scenes, n_rays, -1)
+
+                    for i in range(self.opt.n_img_each_scene):
+                        # Weighted
+                        # [n_scenes, n_slots, n_rays, n_samples, 4]  
+                        rgbs = weighted_raws[i, k, ..., :3]
+                        densities = weighted_raws[i, k, ..., 3:]
+                        t_vals_ = t_vals[i, ...]
+                        directions_ = directions[i, ...]
+
+                        # print(n_scenes, "*", n_rays, "*", 65)
+                        # print(rgbs.shape, densities.shape, t_vals.shape, directions.shape)
+
+                        comp_rgb, distance, acc, weights = mip.volumetric_rendering(
+                            rgbs,
+                            densities,
+                            t_vals_,
+                            directions_.flatten(end_dim=-2)
+                        )
+                        rendered = comp_rgb.view(64, 64, 3).permute(2, 0, 1)
+                        tensorboard.add_image(f"weighted_raws/{k}_{i}", tensor2im(rendered).transpose(2, 0, 1), global_step=self.global_step)
+
+                        rgbs = raws[i, k, ..., :3]
+                        densities = raws[i, k, ..., 3:]
+                        comp_rgb, distance, acc, weights = mip.volumetric_rendering(
+                            rgbs,
+                            densities,
+                            t_vals_,
+                            directions_.flatten(end_dim=-2)
+                        )
+                        rendered = comp_rgb.view(64, 64, 3).permute(2, 0, 1)
+                        tensorboard.add_image(f"unweighted_raws/{k}_{i}", tensor2im(rendered).transpose(2, 0, 1), global_step=self.global_step)
+
 
                     # Render attention
                     b_attn = b_attn.view(B, K, 1, 64, 64)

@@ -33,7 +33,8 @@ if __name__=='__main__':
         strategy="ddp", # ddp_spawn
         max_epochs=opt.niter + opt.niter_decay + 1,
         callbacks=[lr_monitor],
-        logger=logger
+        logger=logger,
+        log_every_n_steps = 1
     )
 
     print('Start training...')

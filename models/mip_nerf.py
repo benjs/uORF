@@ -195,6 +195,7 @@ def sample_along_rays(origins, directions, radii, num_samples, near, far):
         far: jnp.ndarray, [batch_size, 1], far clip.
     """
     B = origins.shape[0]
+    # print(origins.shape, directions.shape, radii.shape, type(num_samples), near.shape, far.shape)
 
     t_vals = torch.linspace(0, 1, num_samples + 1, device=directions.device)
     t_vals = near * (1 - t_vals) + far * t_vals
@@ -325,7 +326,7 @@ class MipNerf(nn.Module):
         self.far = 20
         self.max_exponent_point = 5
 
-    def forward(self, rays: Rays, z_slots: torch.Tensor):
+    def forward(self, z_slots: torch.Tensor, rays: Rays):
         n_scenes, h, w, _ = rays.origins.shape  # [n_scenes, n_rays, 3]
         n_batches, n_slots, _ = z_slots.shape  # [n_batches, n_slots, n_channels]
         n_rays = h*w
@@ -363,20 +364,20 @@ class MipNerf(nn.Module):
         z_slots = z_slots.view(n_batches, n_slots, 1, -1)
 
         # Expand rays for each scene by the number of slots
-        samples_enc = samples_enc.expand(-1, n_slots, -1, -1, -1)
-        viewdirs_enc = viewdirs_enc.expand(-1, n_slots, -1, -1)
-        t_vals = t_vals.expand(-1, n_slots, -1, -1)
+        samples_enc = samples_enc.repeat(1, n_slots, 1, 1, 1)
+        viewdirs_enc = viewdirs_enc.repeat(1, n_slots, 1, 1)
+        t_vals = t_vals.repeat(1, n_slots, 1, 1)
 
         # Expand slots for each scene by number of rays
         n_scenes_single_batch = n_scenes // n_batches
-        z_slots = z_slots.expand(n_scenes_single_batch, -1, n_rays, -1)
+        z_slots = z_slots.repeat(n_scenes_single_batch, 1, n_rays, 1)
 
         # Flatten
         B = n_scenes*n_slots*n_rays
-        samples_enc = samples_enc.reshape(n_scenes*n_slots*n_rays, self.num_samples, -1)
-        viewdirs_enc = viewdirs_enc.reshape(n_scenes*n_slots*n_rays, -1)
-        t_vals = t_vals.reshape(n_scenes*n_slots*n_rays, -1)
-        z_slots = z_slots.reshape(n_scenes*n_slots*n_rays, -1)
+        samples_enc = samples_enc.view(n_scenes*n_slots*n_rays, self.num_samples, -1)
+        viewdirs_enc = viewdirs_enc.view(n_scenes*n_slots*n_rays, -1)
+        t_vals = t_vals.view(n_scenes*n_slots*n_rays, -1)
+        z_slots = z_slots.view(n_scenes*n_slots*n_rays, -1)
 
         raw_rgb, raw_density = self.mlp(samples_enc, z_slots, viewdirs_enc)
 
@@ -391,7 +392,9 @@ class MipNerf(nn.Module):
         #     rays.directions,
         # )
 
-        return raw_rgb, raw_density, t_vals  # [B, num_samples, 3], [B, num_samples, 1], [B, num_samples+1]
+        #print(t_vals.shape)
+
+        return raw_rgb, raw_density, t_vals  # [B, num_samples, 3], [B, num_samples, 1], [n_scenes*n_slots*n_rays, num_samples+1]
 
 
 class uorfMipNerf(nn.Module):
@@ -414,8 +417,8 @@ class uorfMipNerf(nn.Module):
         fg_z_slots = z_slots[:, 1:, :]  # [n_batches, n_slots - 1, n_channels]
 
         # Run foreground and background NeRF
-        bg_raw_rgb, bg_raw_density, t_vals = self.bg_nerf(rays, bg_z_slots)
-        fg_raw_rgb, fg_raw_density, _ = self.fg_nerf(rays, fg_z_slots)
+        bg_raw_rgb, bg_raw_density, t_vals = self.bg_nerf(bg_z_slots, rays)
+        fg_raw_rgb, fg_raw_density, _ = self.fg_nerf(fg_z_slots, rays)
 
         assert self.bg_nerf.num_samples == self.fg_nerf.num_samples
         n_samples = self.bg_nerf.num_samples
@@ -427,8 +430,8 @@ class uorfMipNerf(nn.Module):
         fg_raw_density = fg_raw_density.view(n_scenes, n_slots-1, n_rays, n_samples, 1)
 
         # Concat results in slots dimension
-        raw_rgb = torch.cat((bg_raw_rgb, fg_raw_rgb), dim=1)  # [n_scenes, n_slots, n_samples, 3]
-        raw_density = torch.cat((bg_raw_density, fg_raw_density), dim=1)  # [n_scenes, n_slots, n_samples, 1]
+        raw_rgb = torch.cat((bg_raw_rgb, fg_raw_rgb), dim=1)  # [n_scenes, n_slots, n_rays, n_samples, 3]
+        raw_density = torch.cat((bg_raw_density, fg_raw_density), dim=1)  # [n_scenes, n_slots, n_rays, n_samples, 1]
 
         rgb = self.rgb_activation(raw_rgb)
         rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
@@ -441,8 +444,16 @@ class uorfMipNerf(nn.Module):
         raws = torch.cat((rgb, density), dim=-1)
         weighted_raws = raws * weights
 
+        # print("before", weighted_raws.shape)
+
         # Sum over slots
         combined_raws = weighted_raws.sum(dim=1)  # [n_scenes, n_rays, n_samples, 4]
+        # print("after", combined_raws.shape)
+
+        # print(combined_raws.shape)
+        # print(weighted_raws.shape)
+        # print(raws.shape)
+        # print(t_vals.shape)
 
         # [n_scenes, n_rays, n_samples, 4], 
         # [n_scenes, n_slots, n_rays, n_samples, 4],
