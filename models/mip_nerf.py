@@ -239,6 +239,52 @@ def lift_gaussian(directions, t_mean, t_var, r_var):
     return mean, cov_diag
 
 
+class MipBGMLP(nn.Module):
+    def __init__(self, mlp_num_features=64, input_features=30, z_slots_features=64, condition_num_features: int = 33):
+        super().__init__()
+
+        self.before_skip = nn.Sequential(
+            nn.Linear(in_features=input_features+z_slots_features, out_features=mlp_num_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
+            nn.ReLU(inplace=True),
+        )
+
+        self.after_skip = nn.Sequential(
+            nn.Linear(
+                in_features=mlp_num_features + input_features + z_slots_features,
+                out_features=mlp_num_features
+            ),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=mlp_num_features, out_features=mlp_num_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_features=mlp_num_features, out_features=4)
+        )
+
+    def forward(self, x, z_slots, condition=None):
+        batch_size, num_samples, _ = x.shape  # [batch size, num samples, features]
+        assert z_slots.shape[0] == batch_size, \
+            f"z_slots has to be of shape [{batch_size}, z_feat], but {list(z_slots.shape)} was given."
+
+        # Repeat z_slots for each batch input: [batch_size, z_feat] -> [batch_size, num_samples, z_feat]
+        z_slots = z_slots[:, None, :].repeat(1, num_samples, 1)
+        z_slots = z_slots.view(batch_size * num_samples, z_slots.shape[-1])  # [batch_size*num_samples, z_feat]
+
+        x = x.view(batch_size * num_samples, x.shape[-1])
+        inputs = torch.cat((x, z_slots), dim=-1)
+
+        x = self.before_skip(inputs)
+        x = torch.cat([x, inputs], dim=-1)
+        x = self.after_skip(x)  # [batch_size*num_samples, 4]
+
+        raws = x.view(batch_size, num_samples, 4)
+        return raws[..., :3], raws[..., 3:]
+
+
 class MipMLP(nn.Module):
     def __init__(self, mlp_num_features=64, input_features=30, z_slots_features=64, condition_num_features: int = 33):
         super().__init__()
@@ -317,10 +363,10 @@ class MipMLP(nn.Module):
 
 
 class MipNerf(nn.Module):
-    def __init__(self):
+    def __init__(self, mlp_class=MipMLP):
         super().__init__()
 
-        self.mlp = MipMLP()
+        self.mlp = mlp_class()
         self.num_samples = 64
         self.near = 6
         self.far = 20
@@ -401,7 +447,7 @@ class uorfMipNerf(nn.Module):
     def __init__(self):
         super().__init__()
         self.fg_nerf = MipNerf()
-        self.bg_nerf = MipNerf()
+        self.bg_nerf = MipNerf(mlp_class=MipBGMLP)
 
         self.rgb_activation = nn.Sigmoid()
         self.density_activation = nn.Softplus()
