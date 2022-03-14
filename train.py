@@ -6,6 +6,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 from models.train_model import uorfGanModel
 from data import MultiscenesDataModule
+from models.train_nogan_model import uorfNoGanModel
 from util.options import parse_custom_options
 
 if __name__=='__main__':
@@ -17,8 +18,8 @@ if __name__=='__main__':
     print('Creating dataset...')
     dataset = MultiscenesDataModule(opt)  # create a dataset given opt.dataset_mode and other options
 
-    print('Creating module...')
-    module = uorfGanModel(opt)
+    print('Creating NOGAN module...')
+    module = uorfNoGanModel(opt) # uorfGanModel(opt)
 
     lr_monitor = LearningRateMonitor(logging_interval='step')
     logger = TensorBoardLogger(
