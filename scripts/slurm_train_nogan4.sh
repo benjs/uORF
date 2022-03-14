@@ -2,11 +2,11 @@
 
 #SBATCH --job-name=uORF
 #SBATCH --ntasks=1
-#SBATCH --time=19:00:00
+#SBATCH --time=10:00:00
 
 # Number of gpus. Available nodes: dev_gpu_4, gpu_4, gpu_8
-#SBATCH --gres=gpu:8
-#SBATCH --partition=gpu_8
+#SBATCH --gres=gpu:4
+#SBATCH --partition=gpu_4
 
 # Output files
 #SBATCH --output=../out/T-%x.%j.out

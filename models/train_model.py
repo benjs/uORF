@@ -213,21 +213,71 @@ class uorfGanModel(pl.LightningModule):
                         # using the computed masks, we gather the rays
                         # from the original sized image
                         # --------------------------------------------- #
+                        mask_s = mask[s]
+                        
+                        while(True):
+                            mask_morph = torch.zeros_like(mask_s, dtype=bool)
+                            mask_morph[1:-1, 1:-1] = \
+                                torch.min(mask_s.unfold(0, 3, 1).unfold(1, 3, 1).reshape((128-2)**2, 9), dim=1)[0].view(128-2, 128-2)
+
+                            assert mask_morph.shape == mask_s.shape
+                            contours = mask_s.logical_xor(mask_morph)
+                            mask_s = mask_morph
+                            num_rays = torch.sum(mask_s)
+
+                            if num_rays < out_size**2:
+                                contours_indices = self.mask_idx_img.masked_select(contours)
+                                num_contour = len(contours_indices)
+
+                                indices_needed = min(out_size**2 - num_rays, num_contour)
+                                additional_idx = contours_indices[torch.randperm(num_contour)[:indices_needed]]
+                
+                                mask_s = mask_s.view(128**2)
+                                mask_s[additional_idx] = True
+                                mask_s = mask_s.view(128, 128)
+                                break
+
+                        if num_rays < out_size**2:
+                            while(True):
+                                mask_morph = torch.zeros_like(mask_s, dtype=bool)
+                                mask_morph[1:-1, 1:-1] = \
+                                    torch.max(mask_s.unfold(0, 3, 1).unfold(1, 3, 1).reshape((128-2)**2, 9), dim=1)[0].view(128-2, 128-2)
+
+                                assert mask_morph.shape == mask_s.shape
+                                contours = mask_s.logical_xor(mask_morph)
+                                mask_s = mask_morph
+                                num_rays = torch.sum(mask_s)
+
+                                if num_rays > out_size**2:
+                                    contours_indices = self.mask_idx_img.masked_select(contours)
+                                    num_contour = len(contours_indices)
+
+                                    indices_needed = min(num_rays - out_size**2, num_contour)
+                                    remove_idx = contours_indices[torch.randperm(num_contour)[:indices_needed]]
+                    
+                                    mask_s = mask_s.view(128**2)
+                                    mask_s[remove_idx] = False
+                                    mask_s = mask_s.view(128, 128)
+                                    break
 
                         # Ray indices is a vector with values from 0 to 128**2,
                         # which express which ray of the 128**2 image should be rendered
-                        ray_indices = self.mask_idx_img.masked_select(mask[s])
-                        outside_indices = self.mask_idx_img.masked_select(mask[s].logical_not())
+                        ray_indices = self.mask_idx_img.masked_select(mask_s)
+                        outside_indices = self.mask_idx_img.masked_select(mask_s.logical_not())
 
                         # Always render out_size**2 rays.
                         num_rays = len(ray_indices)
                         if num_rays > out_size**2:
+                            print(num_rays, ">", out_size**2)
                             selected_idx = torch.randperm(num_rays)[:out_size**2]
                             ray_indices = ray_indices[selected_idx]
                         elif num_rays < out_size**2:
+                            print(num_rays, "<", out_size**2)
                             num_indices_needed = out_size**2 - num_rays
                             additional_indices = torch.randperm(len(outside_indices))[:num_indices_needed]
                             ray_indices = torch.cat((ray_indices, outside_indices[additional_indices]))
+                        else:
+                            print("equal!!")
 
                         out_indices_cat = torch.ones(self.opt.frustum_size_fine**2, dtype=bool, device=cam2world.device)
                         out_indices_cat[ray_indices] = False
